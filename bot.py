@@ -18,10 +18,12 @@ import logging
 import math
 import os
 import time
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from html import unescape
 
 import httpx
 from dotenv import load_dotenv
@@ -133,7 +135,61 @@ def clip_text(text: str, limit: int) -> str:
 
     if len(text) <= limit:
         return text
-    return text[:limit] + "\n\n…обрезано…"
+    trimmed = text[:limit].rstrip()
+    return f"{trimmed}\n…обрезано…"
+
+
+def _format_code_block(match: re.Match) -> str:
+    """Форматирует многострочный код-блок без Markdown-разметки."""
+
+    code = (match.group(2) or "").strip("\n")
+    if not code:
+        return ""
+    lines = code.splitlines()
+    formatted = "\n".join(f"    {line}" if line else "" for line in lines)
+    return f"\n{formatted}\n"
+
+
+def format_for_display(text: str) -> str:
+    """Приводит ответ модели к удобному для чтения виду без лишних символов."""
+
+    if not text:
+        return ""
+
+    normalized = unescape(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    normalized = re.sub(r"```(\w+)?\n([\s\S]*?)```", _format_code_block, normalized)
+
+    normalized = re.sub(r"`([^`]+)`", r"«\1»", normalized)
+    normalized = re.sub(r"\*\*([^*]+)\*\*", r"\1", normalized)
+    normalized = re.sub(r"__([^_]+)__", r"\1", normalized)
+    normalized = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", normalized)
+    normalized = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"\1", normalized)
+    normalized = re.sub(r"~~([^~]+)~~", r"\1", normalized)
+    normalized = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 — \2", normalized)
+
+    normalized = re.sub(r"(?m)^>\s?", "Цитата: ", normalized)
+    normalized = re.sub(r"(?m)^#{1,6}\s*", "", normalized)
+    normalized = re.sub(r"(?m)^[*-]\s+", "• ", normalized)
+
+    normalized = re.sub(r"\xa0", " ", normalized)
+    normalized = re.sub(r" {2,}", " ", normalized)
+    normalized = re.sub(r"\n +", "\n", normalized)
+
+    return normalized
+
+
+def prepare_display_pair(text: str, limit: int) -> Tuple[str, str]:
+    """Возвращает пару из текста для истории и текста для пользователя."""
+
+    raw = clip_text(text, limit)
+    pretty = format_for_display(raw)
+    if not pretty:
+        pretty = "(пустой ответ)"
+    return raw, pretty
 
 
 def trim_context(messages: List[Dict[str, str]], max_tokens: int) -> Tuple[List[Dict[str, str]], int]:
@@ -561,7 +617,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
             caption = result.text or "Готово ✅"
-            caption_out = clip_text(caption, config.reply_max_chars)
+            raw_caption, display_caption = prepare_display_pair(caption, config.reply_max_chars)
             for data_url in result.images:
                 try:
                     payload = data_url.split(",", 1)[1] if "," in data_url else data_url
@@ -574,43 +630,43 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 bio.name = "image.png"
                 await update.message.reply_photo(photo=bio)
 
-            session.messages.append({"role": "assistant", "content": caption_out})
+            session.messages.append({"role": "assistant", "content": raw_caption})
             await update.message.reply_text(
-                caption_out,
+                display_caption,
                 reply_markup=main_menu_keyboard(),
             )
             return
 
         if result.type == "text":
-            text_out = clip_text(result.text, config.reply_max_chars)
-            session.messages.append({"role": "assistant", "content": text_out})
+            raw_text, display_text = prepare_display_pair(result.text, config.reply_max_chars)
+            session.messages.append({"role": "assistant", "content": raw_text})
             try:
                 await context.bot.edit_message_text(
                     chat_id=placeholder.chat_id,
                     message_id=placeholder.message_id,
-                    text=text_out,
+                    text=display_text,
                     disable_web_page_preview=True,
                 )
             except Exception:
                 await update.message.reply_text(
-                    text_out,
+                    display_text,
                     disable_web_page_preview=True,
                     reply_markup=main_menu_keyboard(),
                 )
             return
 
-        error_text = clip_text(result.text or "Ошибка", config.reply_max_chars)
-        session.messages.append({"role": "assistant", "content": error_text})
+        raw_error, display_error = prepare_display_pair(result.text or "Ошибка", config.reply_max_chars)
+        session.messages.append({"role": "assistant", "content": raw_error})
         try:
             await context.bot.edit_message_text(
                 chat_id=placeholder.chat_id,
                 message_id=placeholder.message_id,
-                text=error_text,
+                text=display_error,
                 disable_web_page_preview=True,
             )
         except Exception:
             await update.message.reply_text(
-                error_text,
+                display_error,
                 disable_web_page_preview=True,
                 reply_markup=main_menu_keyboard(),
             )
