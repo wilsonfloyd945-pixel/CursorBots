@@ -143,6 +143,7 @@ def clip_text(text: str, limit: int) -> str:
 
 CODE_BLOCK_RE = re.compile(r"```(\w+)?\n([\s\S]*?)```", re.MULTILINE)
 INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
 @dataclass(frozen=True)
@@ -152,25 +153,6 @@ class DisplayPayload:
     raw: str
     text: str
     parse_mode: Optional[str] = None
-
-
-def _escape_with_inline_code(segment: str) -> str:
-    """Экранирует текст для HTML, сохраняя подсветку встроенного кода."""
-
-    if not segment:
-        return ""
-
-    escaped_parts: List[str] = []
-    last = 0
-    for match in INLINE_CODE_RE.finditer(segment):
-        if match.start() > last:
-            escaped_parts.append(html_escape(segment[last:match.start()]))
-        code = html_escape(match.group(1))
-        escaped_parts.append(f"<code>{code}</code>")
-        last = match.end()
-    if last < len(segment):
-        escaped_parts.append(html_escape(segment[last:]))
-    return "".join(escaped_parts)
 
 
 def _render_code_blocks_as_html(text: str) -> Optional[str]:
@@ -184,7 +166,7 @@ def _render_code_blocks_as_html(text: str) -> Optional[str]:
         has_code = True
         prefix = text[cursor:match.start()]
         if prefix:
-            fragments.append(_escape_with_inline_code(prefix))
+            fragments.append(render_markdown_to_html(prefix))
 
         code = (match.group(2) or "").strip("\n")
         if code:
@@ -198,43 +180,68 @@ def _render_code_blocks_as_html(text: str) -> Optional[str]:
 
     suffix = text[cursor:]
     if suffix:
-        fragments.append(_escape_with_inline_code(suffix))
+        fragments.append(render_markdown_to_html(suffix))
 
     html_text = "".join(fragments).strip()
     return html_text or None
 
 
-def format_for_display(text: str) -> str:
-    """Приводит ответ модели к удобному для чтения виду без лишних символов."""
+def render_markdown_to_html(text: str) -> str:
+    """Конвертирует упрощённый Markdown в HTML для Telegram."""
 
     if not text:
         return ""
 
-    normalized = unescape(text).replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        return ""
+    code_placeholders: Dict[str, str] = {}
 
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    def inline_code_repl(match: re.Match[str]) -> str:
+        token = f"§CODE{len(code_placeholders)}§"
+        code_placeholders[token] = f"<code>{html_escape(match.group(1))}</code>"
+        return token
 
-    normalized = re.sub(r"`([^`]+)`", r"«\1»", normalized)
-    normalized = re.sub(r"\*\*([^*]+)\*\*", r"\1", normalized)
-    normalized = re.sub(r"__([^_]+)__", r"\1", normalized)
-    normalized = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", normalized)
-    normalized = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"\1", normalized)
-    normalized = re.sub(r"~~([^~]+)~~", r"\1", normalized)
-    normalized = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 — \2", normalized)
+    working = INLINE_CODE_RE.sub(inline_code_repl, text)
 
-    normalized = re.sub(r"(?m)^>\s?", "Цитата: ", normalized)
-    normalized = re.sub(r"(?m)^#{1,6}\s*", "", normalized)
-    normalized = re.sub(r"(?m)^[*-]\s+", "• ", normalized)
+    link_placeholders: Dict[str, Tuple[str, str]] = {}
 
-    normalized = re.sub(r"\xa0", " ", normalized)
-    normalized = re.sub(r" {2,}", " ", normalized)
-    normalized = re.sub(r"\n +", "\n", normalized)
+    def link_repl(match: re.Match[str]) -> str:
+        token = f"§LINK{len(link_placeholders)}§"
+        label = match.group(1)
+        href = match.group(2)
+        link_placeholders[token] = (label, href)
+        return token
 
-    normalized = re.sub(CODE_BLOCK_RE, lambda m: (m.group(2) or "").strip("\n"), normalized)
+    working = LINK_RE.sub(link_repl, working)
 
-    return normalized
+    escaped = html_escape(working)
+    escaped = re.sub(r"\n{3,}", "\n\n", escaped)
+
+    escaped = re.sub(r"(?m)^&gt;\s*", "Цитата: ", escaped)
+
+    def heading_repl(match: re.Match[str]) -> str:
+        return f"<b>{match.group(2).strip()}</b>"
+
+    escaped = re.sub(r"(?m)^(#{1,6})\s*(.+)$", heading_repl, escaped)
+    escaped = re.sub(r"(?m)^[*-]\s+", "• ", escaped)
+
+    escaped = re.sub(r"\*\*([^*]+)\*\*", lambda m: f"<b>{m.group(1)}</b>", escaped)
+    escaped = re.sub(r"__([^_]+)__", lambda m: f"<i>{m.group(1)}</i>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", lambda m: f"<i>{m.group(1)}</i>", escaped)
+    escaped = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", lambda m: f"<i>{m.group(1)}</i>", escaped)
+    escaped = re.sub(r"~~([^~]+)~~", lambda m: f"<s>{m.group(1)}</s>", escaped)
+
+    for token, (label, href) in link_placeholders.items():
+        label_html = render_markdown_to_html(label)
+        safe_href = html_escape(href, quote=True)
+        escaped = escaped.replace(token, f'<a href="{safe_href}">{label_html}</a>')
+
+    for token, html_code in code_placeholders.items():
+        escaped = escaped.replace(token, html_code)
+
+    escaped = escaped.replace("\xa0", " ")
+    escaped = re.sub(r" {2,}", " ", escaped)
+    escaped = re.sub(r"\n +", "\n", escaped)
+
+    return escaped.strip()
 
 
 def prepare_display_payload(text: str, limit: int) -> DisplayPayload:
@@ -250,10 +257,10 @@ def prepare_display_payload(text: str, limit: int) -> DisplayPayload:
     if html_variant:
         return DisplayPayload(raw=raw, text=html_variant, parse_mode=ParseMode.HTML)
 
-    pretty = format_for_display(normalized)
+    pretty = render_markdown_to_html(normalized)
     if not pretty:
-        pretty = "(пустой ответ)"
-    return DisplayPayload(raw=raw, text=pretty)
+        pretty = html_escape("(пустой ответ)")
+    return DisplayPayload(raw=raw, text=pretty, parse_mode=ParseMode.HTML)
 
 
 def trim_context(messages: List[Dict[str, str]], max_tokens: int) -> Tuple[List[Dict[str, str]], int]:
