@@ -347,10 +347,20 @@ class OpenRouterClient:
 # ---------------------------------------------------------------------------
 
 
+HELP_TEXT = (
+    "Как одобрить pull request на GitHub:\n"
+    "1. Откройте вкладку Pull requests нужного репозитория и выберите нужный PR.\n"
+    "2. Перейдите на вкладку Files changed и нажмите Review changes.\n"
+    "3. В открывшемся окне выберите пункт Approve, при необходимости оставьте комментарий и нажмите Submit review.\n\n"
+    "Если вы просто хотите подтвердить, что ответ бота подошёл, напишите «Одобряю» или отправьте 👍 — я отмечу, что всё прошло успешно."
+)
+
+
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton("🤖 Выбрать модель")],
         [KeyboardButton("🗑️ Очистить контекст"), KeyboardButton("📊 Контекст: состояние")],
+        [KeyboardButton("ℹ️ Помощь / как одобрить")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -418,7 +428,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! Я бот с ИИ через OpenRouter.\n"
         "1) Нажмите «🤖 Выбрать модель» и выберите одну из доступных.\n"
         "2) Пишите сообщения — отвечу выбранной моделью.\n"
-        "Кнопки: «🗑️ Очистить контекст», «📊 Контекст: состояние».",
+        "Кнопки: «🗑️ Очистить контекст», «📊 Контекст: состояние», «ℹ️ Помощь / как одобрить».",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        HELP_TEXT,
+        disable_web_page_preview=True,
         reply_markup=main_menu_keyboard(),
     )
 
@@ -471,6 +489,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config, state, client = get_app_components(context)
     user_id = update.effective_user.id
     text = update.message.text.strip()
+    normalized = text.lower()
 
     async with state.user_lock(user_id):
         session = state.get_session(user_id)
@@ -498,6 +517,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             used, pct = context_stats(session.messages, config.context_max_tokens)
             await update.message.reply_text(
                 f"Контекст: ~{used} токенов из {config.context_max_tokens} (~{pct:.1f}%)",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        if text.startswith("ℹ️") or "как одобрить" in normalized:
+            await update.message.reply_text(
+                HELP_TEXT,
+                disable_web_page_preview=True,
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        if normalized in {"одобряю", "одобрено", "approved", "👍"} or normalized.startswith("одобряю"):
+            await update.message.reply_text(
+                "Спасибо за одобрение! Продолжаем работать 🤝",
                 reply_markup=main_menu_keyboard(),
             )
             return
@@ -613,6 +645,7 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
