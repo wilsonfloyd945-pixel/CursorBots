@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from html import escape as html_escape
 from html import unescape
 
 import httpx
@@ -34,6 +35,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -139,15 +141,67 @@ def clip_text(text: str, limit: int) -> str:
     return f"{trimmed}\n…обрезано…"
 
 
-def _format_code_block(match: re.Match) -> str:
-    """Форматирует многострочный код-блок без Markdown-разметки."""
+CODE_BLOCK_RE = re.compile(r"```(\w+)?\n([\s\S]*?)```", re.MULTILINE)
+INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 
-    code = (match.group(2) or "").strip("\n")
-    if not code:
+
+@dataclass(frozen=True)
+class DisplayPayload:
+    """Форматированное представление текста для отправки пользователю."""
+
+    raw: str
+    text: str
+    parse_mode: Optional[str] = None
+
+
+def _escape_with_inline_code(segment: str) -> str:
+    """Экранирует текст для HTML, сохраняя подсветку встроенного кода."""
+
+    if not segment:
         return ""
-    lines = code.splitlines()
-    formatted = "\n".join(f"    {line}" if line else "" for line in lines)
-    return f"\n{formatted}\n"
+
+    escaped_parts: List[str] = []
+    last = 0
+    for match in INLINE_CODE_RE.finditer(segment):
+        if match.start() > last:
+            escaped_parts.append(html_escape(segment[last:match.start()]))
+        code = html_escape(match.group(1))
+        escaped_parts.append(f"<code>{code}</code>")
+        last = match.end()
+    if last < len(segment):
+        escaped_parts.append(html_escape(segment[last:]))
+    return "".join(escaped_parts)
+
+
+def _render_code_blocks_as_html(text: str) -> Optional[str]:
+    """Преобразует Markdown-код-блоки в HTML-формат для Telegram."""
+
+    has_code = False
+    cursor = 0
+    fragments: List[str] = []
+
+    for match in CODE_BLOCK_RE.finditer(text):
+        has_code = True
+        prefix = text[cursor:match.start()]
+        if prefix:
+            fragments.append(_escape_with_inline_code(prefix))
+
+        code = (match.group(2) or "").strip("\n")
+        if code:
+            fragments.append(f"<pre><code>{html_escape(code)}</code></pre>")
+        else:
+            fragments.append("")
+        cursor = match.end()
+
+    if not has_code:
+        return None
+
+    suffix = text[cursor:]
+    if suffix:
+        fragments.append(_escape_with_inline_code(suffix))
+
+    html_text = "".join(fragments).strip()
+    return html_text or None
 
 
 def format_for_display(text: str) -> str:
@@ -161,7 +215,6 @@ def format_for_display(text: str) -> str:
         return ""
 
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    normalized = re.sub(r"```(\w+)?\n([\s\S]*?)```", _format_code_block, normalized)
 
     normalized = re.sub(r"`([^`]+)`", r"«\1»", normalized)
     normalized = re.sub(r"\*\*([^*]+)\*\*", r"\1", normalized)
@@ -179,17 +232,28 @@ def format_for_display(text: str) -> str:
     normalized = re.sub(r" {2,}", " ", normalized)
     normalized = re.sub(r"\n +", "\n", normalized)
 
+    normalized = re.sub(CODE_BLOCK_RE, lambda m: (m.group(2) or "").strip("\n"), normalized)
+
     return normalized
 
 
-def prepare_display_pair(text: str, limit: int) -> Tuple[str, str]:
-    """Возвращает пару из текста для истории и текста для пользователя."""
+def prepare_display_payload(text: str, limit: int) -> DisplayPayload:
+    """Возвращает форматированный текст и режим парсинга для Telegram."""
 
     raw = clip_text(text, limit)
-    pretty = format_for_display(raw)
+    normalized = unescape(raw).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if not normalized:
+        return DisplayPayload(raw=raw, text="(пустой ответ)")
+
+    html_variant = _render_code_blocks_as_html(normalized)
+    if html_variant:
+        return DisplayPayload(raw=raw, text=html_variant, parse_mode=ParseMode.HTML)
+
+    pretty = format_for_display(normalized)
     if not pretty:
         pretty = "(пустой ответ)"
-    return raw, pretty
+    return DisplayPayload(raw=raw, text=pretty)
 
 
 def trim_context(messages: List[Dict[str, str]], max_tokens: int) -> Tuple[List[Dict[str, str]], int]:
@@ -617,7 +681,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
             caption = result.text or "Готово ✅"
-            raw_caption, display_caption = prepare_display_pair(caption, config.reply_max_chars)
+            caption_payload = prepare_display_payload(caption, config.reply_max_chars)
             for data_url in result.images:
                 try:
                     payload = data_url.split(",", 1)[1] if "," in data_url else data_url
@@ -630,46 +694,62 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 bio.name = "image.png"
                 await update.message.reply_photo(photo=bio)
 
-            session.messages.append({"role": "assistant", "content": raw_caption})
-            await update.message.reply_text(
-                display_caption,
-                reply_markup=main_menu_keyboard(),
-            )
+            session.messages.append({"role": "assistant", "content": caption_payload.raw})
+            reply_kwargs = {
+                "text": caption_payload.text,
+                "reply_markup": main_menu_keyboard(),
+            }
+            if caption_payload.parse_mode:
+                reply_kwargs["parse_mode"] = caption_payload.parse_mode
+                reply_kwargs["disable_web_page_preview"] = True
+            await update.message.reply_text(**reply_kwargs)
             return
 
         if result.type == "text":
-            raw_text, display_text = prepare_display_pair(result.text, config.reply_max_chars)
-            session.messages.append({"role": "assistant", "content": raw_text})
+            text_payload = prepare_display_payload(result.text, config.reply_max_chars)
+            session.messages.append({"role": "assistant", "content": text_payload.raw})
             try:
-                await context.bot.edit_message_text(
-                    chat_id=placeholder.chat_id,
-                    message_id=placeholder.message_id,
-                    text=display_text,
-                    disable_web_page_preview=True,
-                )
+                edit_kwargs = {
+                    "chat_id": placeholder.chat_id,
+                    "message_id": placeholder.message_id,
+                    "text": text_payload.text,
+                    "disable_web_page_preview": True,
+                }
+                if text_payload.parse_mode:
+                    edit_kwargs["parse_mode"] = text_payload.parse_mode
+                await context.bot.edit_message_text(**edit_kwargs)
             except Exception:
-                await update.message.reply_text(
-                    display_text,
-                    disable_web_page_preview=True,
-                    reply_markup=main_menu_keyboard(),
-                )
+                reply_kwargs = {
+                    "text": text_payload.text,
+                    "disable_web_page_preview": True,
+                    "reply_markup": main_menu_keyboard(),
+                }
+                if text_payload.parse_mode:
+                    reply_kwargs["parse_mode"] = text_payload.parse_mode
+                await update.message.reply_text(**reply_kwargs)
             return
 
-        raw_error, display_error = prepare_display_pair(result.text or "Ошибка", config.reply_max_chars)
-        session.messages.append({"role": "assistant", "content": raw_error})
+        error_payload = prepare_display_payload(result.text or "Ошибка", config.reply_max_chars)
+        session.messages.append({"role": "assistant", "content": error_payload.raw})
         try:
-            await context.bot.edit_message_text(
-                chat_id=placeholder.chat_id,
-                message_id=placeholder.message_id,
-                text=display_error,
-                disable_web_page_preview=True,
-            )
+            edit_kwargs = {
+                "chat_id": placeholder.chat_id,
+                "message_id": placeholder.message_id,
+                "text": error_payload.text,
+                "disable_web_page_preview": True,
+            }
+            if error_payload.parse_mode:
+                edit_kwargs["parse_mode"] = error_payload.parse_mode
+            await context.bot.edit_message_text(**edit_kwargs)
         except Exception:
-            await update.message.reply_text(
-                display_error,
-                disable_web_page_preview=True,
-                reply_markup=main_menu_keyboard(),
-            )
+            reply_kwargs = {
+                "text": error_payload.text,
+                "disable_web_page_preview": True,
+                "reply_markup": main_menu_keyboard(),
+            }
+            if error_payload.parse_mode:
+                reply_kwargs["parse_mode"] = error_payload.parse_mode
+            await update.message.reply_text(**reply_kwargs)
 
 
 # ---------------------------------------------------------------------------
